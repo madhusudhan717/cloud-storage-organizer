@@ -1,0 +1,78 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-display: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-sans: 'Public Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: #f6f5ff;
+    color: #1e1b4b;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: var(--font-display);
+  }
+
+  code, pre, .font-mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Cloud Organizer visual refresh */
+@layer base {
+  body { background: #f7f7fb; color: #1c1b2e; }
+  button, input, select, textarea { font: inherit; }
+  button { cursor: pointer; }
+}
+
+#root { min-height: 100vh; }
+
+/* Calm lavender workspace with crisp, elevated surfaces */
+body { background: #f7f7fb; }
+#root > div { background: #f7f7fb !important; }
+#root aside { background: #fff !important; border-color: #eceaf5 !important; box-shadow: 8px 0 30px rgba(38, 31, 83, .025); }
+#root aside nav button { min-height: 42px; border-radius: 12px; transition: background-color .18s ease, color .18s ease, transform .18s ease; }
+#root aside nav button:hover { transform: translateX(2px); }
+#root header { background: rgba(255,255,255,.92) !important; border-color: #eceaf5 !important; }
+#root main { max-width: 1480px; padding: clamp(20px, 3vw, 40px); }
+#root main section, #root main article { border-radius: 20px; }
+#root main section[class*='bg-white'] { border-color: #eeedf4; box-shadow: 0 8px 28px rgba(36, 29, 82, .045); }
+#root main [class*='rounded-2xl'][class*='border'] { transition: border-color .2s ease, box-shadow .2s ease, transform .2s ease; }
+#root main [class*='rounded-2xl'][class*='border']:hover { border-color: #d9d3fb; }
+#root input:not([type='checkbox']), #root select, #root textarea { border-radius: 11px; }
+#root input:focus-visible, #root select:focus-visible, #root textarea:focus-visible, #root button:focus-visible { outline: 3px solid rgba(124, 105, 238, .28); outline-offset: 2px; }
+@media (max-width: 760px) {
+  #root aside { position: sticky; top: 0; height: 100vh; }
+  #root header { padding-left: 16px; padding-right: 16px; }
+  #root main { padding: 18px 14px 28px; }
+}
+
+
+@media (max-width: 760px) {
+  #root > div { flex-direction: column; }
+  #root aside { width: 100% !important; height: auto; position: relative; border-right: 0 !important; border-bottom: 1px solid #eceaf5; }
+  #root aside > div:first-child { padding: 12px 14px; }
+  #root aside nav { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; scrollbar-width: thin; }
+  #root aside nav button { width: auto; min-width: max-content; padding: 9px 12px; }
+  #root aside > div:last-child { display: none; }
+  #root header { position: relative; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+
+@media (max-width: 760px) {
+  #root aside > div:last-child { display: block; padding: 10px 14px; border-top: 1px solid #eceaf5; }
+  #root aside > div:last-child > div:last-child { display: none; }
+  #root aside > div:last-child > div:first-child { padding: 8px 10px; }
+}

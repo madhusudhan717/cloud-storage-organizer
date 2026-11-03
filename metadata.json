@@ -1,0 +1,6 @@
+{
+  "name": "Cloud Storage Organizer — Object Storage & Access Controls",
+  "description": "S3 & MinIO object storage management console featuring prefix categorization, custom metadata, object tagging, private-by-default access controls, isolated public-read sandbox, and HMAC-SHA256 pre-signed URLs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

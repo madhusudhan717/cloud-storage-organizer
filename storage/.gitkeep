@@ -1,0 +1,2 @@
+# Placeholder to retain the local storage staging directory in Git.
+# Downloaded or staged files in this folder are ignored via .gitignore.
