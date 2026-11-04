@@ -1,25 +1,47 @@
+import "dotenv/config";
 import crypto from 'crypto';
 import { execFile } from 'child_process';
-import express, { Request, Response } from 'express';
+import express, { NextFunction, Request, Response } from 'express';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import {
+  CopyObjectCommand,
+  DeleteObjectCommand,
+  GetObjectCommand,
+  GetObjectTaggingCommand,
+  HeadBucketCommand,
+  HeadObjectCommand,
+  ListObjectsV2Command,
+  PutObjectCommand,
+  PutObjectTaggingCommand,
+  S3Client,
+} from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { createServer as createViteServer } from 'vite';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const S3_CONFIG = {
-  endpointUrl: process.env.S3_ENDPOINT_URL || 'http://localhost:9000',
-  accessKey: process.env.S3_ACCESS_KEY || 'minioadmin',
-  secretKey: process.env.S3_SECRET_KEY || 'minioadmin_local_dev_secret_key',
-  privateBucket: process.env.S3_BUCKET_NAME || 'cloud-organizer-private',
-  publicDemoBucket: process.env.S3_PUBLIC_DEMO_BUCKET || 'cloud-organizer-public-sandbox',
-  region: process.env.S3_REGION || 'us-east-1',
+  bucket: process.env.S3_BUCKET_NAME || 'madhu-cloud-organizer-storage-2026',
+  region: process.env.AWS_REGION || process.env.S3_REGION || 'ap-southeast-2',
+  accessKey: process.env.AWS_ACCESS_KEY_ID || process.env.S3_ACCESS_KEY || '',
+  secretKey: process.env.AWS_SECRET_ACCESS_KEY || process.env.S3_SECRET_KEY || '',
   defaultPresignedExpiration: Number(process.env.DEFAULT_PRESIGNED_EXPIRATION || 300),
 };
 
-const CORE_CATEGORIES = ['documents', 'images', 'reports', 'projects'] as const;
+if (Boolean(S3_CONFIG.accessKey) !== Boolean(S3_CONFIG.secretKey)) {
+  throw new Error('Set both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or neither.');
+}
+
+const s3 = new S3Client({
+  region: S3_CONFIG.region,
+  ...(S3_CONFIG.accessKey && S3_CONFIG.secretKey
+    ? { credentials: { accessKeyId: S3_CONFIG.accessKey, secretAccessKey: S3_CONFIG.secretKey } }
+    : {}),
+  
+});
 
 interface StoredObjectRecord {
   key: string;
@@ -30,7 +52,6 @@ interface StoredObjectRecord {
   sizeBytes: number;
   lastModified: string;
   etag: string;
-  body: Buffer;
   metadata: Record<string, string>;
   tags: Record<string, string>;
 }
@@ -51,817 +72,415 @@ interface TrackedPresignedLink {
   objectRemainsPrivate: boolean;
 }
 
-const buckets: Record<string, Map<string, StoredObjectRecord>> = {
-  [S3_CONFIG.privateBucket]: new Map(),
-  [S3_CONFIG.publicDemoBucket]: new Map(),
-};
-
 const trackedPresignedLinks: TrackedPresignedLink[] = [];
-
-let publicDemoModeEnabled = false;
 let defaultExpirationSeconds = S3_CONFIG.defaultPresignedExpiration;
 
 function sanitizeFilename(filename: string): string {
-  const trimmed = (filename || '').trim();
-  if (!trimmed || trimmed.includes('\0')) {
-    throw new Error('File name cannot be empty or contain null bytes.');
-  }
+  const trimmed = String(filename || '').trim();
+  if (!trimmed || trimmed.includes('\0')) throw new Error('File name cannot be empty or contain null bytes.');
   const normalized = trimmed.replace(/\\/g, '/');
-  if (normalized.split('/').includes('..') || normalized.startsWith('/')) {
-    throw new Error('Path traversal sequences are prohibited in file names.');
-  }
+  if (normalized.split('/').includes('..') || normalized.startsWith('/')) throw new Error('Path traversal sequences are prohibited in file names.');
   const base = path.posix.basename(normalized).trim();
-  if (!base || base === '.' || base === '..' || base.startsWith('.')) {
-    throw new Error('Invalid or hidden file name is not permitted.');
-  }
+  if (!base || base === '.' || base === '..' || base.startsWith('.')) throw new Error('Invalid or hidden file name is not permitted.');
   return base.replace(/[^A-Za-z0-9._-]/g, '_');
 }
 
 function sanitizeCategoryPrefix(rawCategory: string): string {
-  const cleaned = (rawCategory || 'documents')
-    .trim()
-    .toLowerCase()
-    .replace(/^\/+|\/+$/g, '');
-  if (!cleaned || cleaned.includes('..') || cleaned.includes('\0')) {
-    throw new Error('Invalid category prefix.');
-  }
+  const cleaned = String(rawCategory || 'documents').trim().toLowerCase().replace(/^\/+|\/+$/g, '');
+  if (!cleaned || cleaned.includes('..') || cleaned.includes('\0')) throw new Error('Invalid category prefix.');
   const safe = cleaned.replace(/[^a-z0-9_-]/g, '-');
-  if (!safe) {
-    throw new Error('Category prefix must contain alphanumeric characters.');
-  }
+  if (!safe) throw new Error('Category prefix must contain alphanumeric characters.');
   return safe;
 }
 
-function seedInitialObjects(): void {
-  const seedItems: Array<{
-    filename: string;
-    category: string;
-    contentType: string;
-    content: string;
-    metadata: Record<string, string>;
-    tags: Record<string, string>;
-  }> = [
-    {
-      filename: 'zero_trust_storage_policy_v2.pdf',
-      category: 'documents',
-      contentType: 'application/pdf',
-      content:
-        '%PDF-1.7\nCloud Security Architecture — Zero-Trust Object Storage Standard\n1. All primary buckets enforce private-by-default ACLs.\n2. External sharing requires HMAC-SHA256 pre-signed URLs with bounded TTL.\n',
-      metadata: {
-        department: 'Cloud Security',
-        owner: 'Elena Rostova',
-        description: 'Zero-trust S3 and MinIO bucket governance policy document',
-      },
-      tags: {
-        Category: 'Academic',
-        Type: 'Policy',
-        Department: 'Security',
-      },
-    },
-    {
-      filename: 'cloud_onboarding_handbook.pdf',
-      category: 'documents',
-      contentType: 'application/pdf',
-      content:
-        '%PDF-1.7\nBeginner Guide to Object Storage, Prefixes, Metadata, and Pre-Signed Sharing.\n',
-      metadata: {
-        department: 'IT Operations',
-        owner: 'Marcus Vance',
-        description: 'Step-by-step onboarding guide for organizing team cloud files',
-      },
-      tags: {
-        Category: 'Academic',
-        Type: 'Guide',
-        Department: 'IT',
-      },
-    },
-    {
-      filename: 'q3_bucket_access_audit.csv',
-      category: 'reports',
-      contentType: 'text/csv',
-      content:
-        'timestamp_utc,bucket,object_key,principal,action,http_status\n2026-10-19T14:20:00Z,cloud-organizer-private,documents/zero_trust_storage_policy_v2.pdf,anonymous,s3:GetObject,403\n2026-10-19T14:21:12Z,cloud-organizer-private,documents/zero_trust_storage_policy_v2.pdf,presigned-sigv4,s3:GetObject,200\n2026-10-19T14:28:05Z,cloud-organizer-private,documents/zero_trust_storage_policy_v2.pdf,expired-sigv4,s3:GetObject,403\n',
-      metadata: {
-        department: 'Compliance',
-        owner: 'Audit Automation',
-        description: 'Quarterly S3 access control verification log and security metrics',
-      },
-      tags: {
-        Category: 'Academic',
-        Type: 'Report',
-        Quarter: 'Q3',
-      },
-    },
-    {
-      filename: 'minio_cluster_topology.svg',
-      category: 'images',
-      contentType: 'image/svg+xml',
-      content:
-        '<svg xmlns="http://www.w3.org/2000/svg" width="480" height="240" viewBox="0 0 480 240"><rect width="480" height="240" rx="16" fill="#eef2ff"/><rect x="24" y="28" width="432" height="44" rx="10" fill="#4f46e5"/><text x="44" y="55" fill="#ffffff" font-family="sans-serif" font-weight="bold" font-size="15">MinIO S3-Compatible Storage Topology</text><rect x="24" y="92" width="204" height="120" rx="12" fill="#ffffff" stroke="#6366f1" stroke-width="2"/><text x="42" y="125" fill="#1e1b4b" font-family="sans-serif" font-weight="bold" font-size="13">cloud-organizer-private</text><text x="42" y="150" fill="#0d9488" font-family="sans-serif" font-size="12">Private by Default (Protected)</text><text x="42" y="175" fill="#64748b" font-family="sans-serif" font-size="11">Anonymous HTTP: 403 Denied</text><rect x="252" y="92" width="204" height="120" rx="12" fill="#ffffff" stroke="#f59e0b" stroke-width="2"/><text x="270" y="125" fill="#1e1b4b" font-family="sans-serif" font-weight="bold" font-size="13">public-sandbox (Isolated)</text><text x="270" y="150" fill="#d97706" font-family="sans-serif" font-size="12">Opt-In Demo Bucket Only</text><text x="270" y="175" fill="#64748b" font-family="sans-serif" font-size="11">Never weakens private vault</text></svg>',
-      metadata: {
-        department: 'Platform Engineering',
-        owner: 'Priya Nair',
-        description: 'Visual architecture diagram of private vs isolated sandbox buckets',
-      },
-      tags: {
-        Category: 'Engineering',
-        Type: 'Diagram',
-        Project: 'Topology',
-      },
-    },
-    {
-      filename: 'boto3_migration_manifest.json',
-      category: 'projects',
-      contentType: 'application/json',
-      content: JSON.stringify(
-        {
-          project: 'Cloud Storage Organizer',
-          sdk: 'boto3 >= 1.34.0',
-          signatureVersion: 's3v4',
-          categories: ['documents/', 'images/', 'reports/', 'projects/'],
-          privateByDefault: true,
-        },
-        null,
-        2
-      ),
-      metadata: {
-        department: 'Core Platform',
-        owner: 'Python Guild',
-        description: 'Boto3 S3v4 client configuration manifest and prefix schema',
-      },
-      tags: {
-        Category: 'Project',
-        Type: 'Manifest',
-        Department: 'Engineering',
-      },
-    },
-  ];
-
-  seedItems.forEach((item, index) => {
-    const key = `${item.category}/${item.filename}`;
-    const body = Buffer.from(item.content, 'utf-8');
-    const etag = crypto.createHash('md5').update(body).digest('hex');
-    const timestamp = new Date(Date.now() - (seedItems.length - index) * 3600_000)
-      .toISOString()
-      .replace(/\.\d{3}Z$/, 'Z');
-
-    buckets[S3_CONFIG.privateBucket].set(key, {
-      key,
-      filename: item.filename,
-      category: item.category,
-      bucket: S3_CONFIG.privateBucket,
-      contentType: item.contentType,
-      sizeBytes: body.length,
-      lastModified: timestamp,
-      etag,
-      body,
-      metadata: item.metadata,
-      tags: item.tags,
-    });
-  });
+function normalizeMetadata(input: unknown): Record<string, string> {
+  const result: Record<string, string> = {};
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return result;
+  for (const [key, value] of Object.entries(input)) {
+    const cleanKey = key.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-').slice(0, 64);
+    const cleanValue = String(value ?? '').trim().slice(0, 1800);
+    if (cleanKey && cleanValue) result[cleanKey] = cleanValue;
+  }
+  return result;
 }
 
-seedInitialObjects();
+function normalizeTags(input: unknown): Record<string, string> {
+  const result: Record<string, string> = {};
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return result;
+  for (const [key, value] of Object.entries(input)) {
+    const cleanKey = key.trim().slice(0, 128);
+    const cleanValue = String(value ?? '').trim().slice(0, 256);
+    if (cleanKey && cleanValue) result[cleanKey] = cleanValue;
+  }
+  if (Object.keys(result).length > 10) throw new Error('Amazon S3 allows a maximum of 10 object tags.');
+  return result;
+}
 
-function signPresignedParams(
-  bucket: string,
-  key: string,
-  amzDate: string,
-  expiresSeconds: number,
-  issuedMs: number,
-  credential: string
-): string {
-  const canonical = `GET\n/${bucket}/${key}\n${amzDate}\n${expiresSeconds}\n${issuedMs}\n${credential}`;
-  return crypto
-    .createHmac('sha256', S3_CONFIG.secretKey)
-    .update(canonical, 'utf-8')
-    .digest('hex');
+function toTaggingString(tags: Record<string, string>): string | undefined {
+  const pairs = Object.entries(tags);
+  if (!pairs.length) return undefined;
+  return pairs.map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`).join('&');
+}
+
+function parseTagSet(tagSet: Array<{ Key?: string; Value?: string }> = []): Record<string, string> {
+  const tags: Record<string, string> = {};
+  for (const tag of tagSet) if (tag.Key) tags[tag.Key] = tag.Value || '';
+  return tags;
+}
+
+function assertPrivateBucket(bucket: unknown): string {
+  const name = String(bucket || S3_CONFIG.bucket);
+  if (name !== S3_CONFIG.bucket) throw new Error('Only the configured private AWS S3 bucket is enabled. Public demo bucket operations are disabled.');
+  return name;
+}
+
+async function getObjectRecord(key: string): Promise<StoredObjectRecord | null> {
+  try {
+    const [head, tagResult] = await Promise.all([
+      s3.send(new HeadObjectCommand({ Bucket: S3_CONFIG.bucket, Key: key })),
+      s3.send(new GetObjectTaggingCommand({ Bucket: S3_CONFIG.bucket, Key: key })).catch(() => ({ TagSet: [] })),
+    ]);
+    const filename = path.posix.basename(key);
+    const category = key.split('/')[0] || 'documents';
+    return {
+      key,
+      filename,
+      category,
+      bucket: S3_CONFIG.bucket,
+      contentType: head.ContentType || 'application/octet-stream',
+      sizeBytes: Number(head.ContentLength || 0),
+      lastModified: (head.LastModified || new Date()).toISOString(),
+      etag: String(head.ETag || '').replace(/"/g, ''),
+      metadata: head.Metadata || {},
+      tags: parseTagSet(tagResult.TagSet || []),
+    };
+  } catch (error: any) {
+    const status = error?.$metadata?.httpStatusCode;
+    const name = error?.name || error?.Code;
+    if (status === 404 || name === 'NotFound' || name === 'NoSuchKey') return null;
+    throw error;
+  }
+}
+
+async function listAllObjects(): Promise<StoredObjectRecord[]> {
+  const records: StoredObjectRecord[] = [];
+  let continuationToken: string | undefined;
+  do {
+    const page = await s3.send(new ListObjectsV2Command({
+      Bucket: S3_CONFIG.bucket,
+      ContinuationToken: continuationToken,
+      MaxKeys: 1000,
+    }));
+    const keys = (page.Contents || []).map((item) => item.Key).filter((key): key is string => Boolean(key));
+    const pageRecords = await Promise.all(keys.map((key) => getObjectRecord(key)));
+    records.push(...pageRecords.filter((record): record is StoredObjectRecord => record !== null));
+    continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
+  } while (continuationToken);
+  return records;
 }
 
 function serializeObject(obj: StoredObjectRecord) {
-  const isSandbox = obj.bucket === S3_CONFIG.publicDemoBucket;
   return {
-    key: obj.key,
-    filename: obj.filename,
-    category: obj.category,
-    bucket: obj.bucket,
-    contentType: obj.contentType,
-    sizeBytes: obj.sizeBytes,
-    lastModified: obj.lastModified,
-    etag: obj.etag,
-    accessMode: isSandbox && publicDemoModeEnabled ? 'Public-Read (Isolated Sandbox)' : 'Private',
-    metadata: obj.metadata,
-    tags: obj.tags,
+    ...obj,
+    accessMode: 'Private',
   };
+}
+
+function basicAuth(req: Request, res: Response, next: NextFunction) {
+  const username = process.env.APP_USERNAME;
+  const password = process.env.APP_PASSWORD;
+  if (!username && !password) return next();
+  if (!username || !password) return res.status(500).send('Both APP_USERNAME and APP_PASSWORD must be configured.');
+  const header = req.headers.authorization || '';
+  const supplied = header.startsWith('Basic ') ? Buffer.from(header.slice(6), 'base64').toString('utf8') : '';
+  const separator = supplied.indexOf(':');
+  const suppliedUser = separator >= 0 ? supplied.slice(0, separator) : '';
+  const suppliedPassword = separator >= 0 ? supplied.slice(separator + 1) : '';
+  const safeEqual = (a: string, b: string) => {
+    const aa = Buffer.from(a);
+    const bb = Buffer.from(b);
+    return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+  };
+  if (safeEqual(suppliedUser, username) && safeEqual(suppliedPassword, password)) return next();
+  res.setHeader('WWW-Authenticate', 'Basic realm="Cloud Storage Organizer"');
+  return res.status(401).send('Authentication required.');
 }
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT || 3000);
 
-  app.use(express.json({ limit: '25mb' }));
-
-  // ---------------------------------------------------------------------------
-  // 1. Storage Connection, Summary Metrics & Category Breakdown (No Secrets)
-  // ---------------------------------------------------------------------------
-  app.get('/api/storage/status', (_req: Request, res: Response) => {
-    const privateObjects = Array.from(buckets[S3_CONFIG.privateBucket].values());
-    const sandboxObjects = Array.from(buckets[S3_CONFIG.publicDemoBucket].values());
-    const allObjects = [...privateObjects, ...sandboxObjects];
-    const totalBytes = allObjects.reduce((acc, o) => acc + o.sizeBytes, 0);
-
-    const nowMs = Date.now();
-    const activeLinksCount = trackedPresignedLinks.filter((l) => l.expiresMs > nowMs).length;
-
-    const categoryBreakdown: Record<string, { count: number; bytes: number }> = {
-      documents: { count: 0, bytes: 0 },
-      images: { count: 0, bytes: 0 },
-      reports: { count: 0, bytes: 0 },
-      projects: { count: 0, bytes: 0 },
-    };
-
-    for (const obj of allObjects) {
-      if (!categoryBreakdown[obj.category]) {
-        categoryBreakdown[obj.category] = { count: 0, bytes: 0 };
-      }
-      categoryBreakdown[obj.category].count += 1;
-      categoryBreakdown[obj.category].bytes += obj.sizeBytes;
+  app.disable('x-powered-by');
+  app.use(basicAuth);
+  app.use((req, res, next) => {
+    const allowedOrigins = (process.env.CORS_ORIGIN || '').split(',').map((item) => item.trim()).filter(Boolean);
+    const origin = req.headers.origin;
+    if (origin && (allowedOrigins.includes('*') || allowedOrigins.includes(origin))) {
+      res.setHeader('Access-Control-Allow-Origin', allowedOrigins.includes('*') ? '*' : origin!);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
     }
-
-    const privateFilesCount = allObjects.filter(
-      (o) => !(o.bucket === S3_CONFIG.publicDemoBucket && publicDemoModeEnabled)
-    ).length;
-
-    res.json({
-      connected: true,
-      service: 'MinIO / AWS S3v4 Compatible Storage',
-      endpointUrl: S3_CONFIG.endpointUrl,
-      region: S3_CONFIG.region,
-      privateBucket: S3_CONFIG.privateBucket,
-      publicDemoBucket: S3_CONFIG.publicDemoBucket,
-      publicDemoModeEnabled,
-      defaultPresignedExpiration: defaultExpirationSeconds,
-      stats: {
-        totalFiles: allObjects.length,
-        privateFiles: privateFilesCount,
-        sandboxFiles: sandboxObjects.length,
-        totalBytes,
-        activeTemporaryLinks: activeLinksCount,
-        totalTrackedLinks: trackedPresignedLinks.length,
-      },
-      categoryBreakdown,
-    });
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
   });
+  app.use(express.json({ limit: '40mb' }));
 
-  // ---------------------------------------------------------------------------
-  // 2. List Objects with Category Prefix & Search Filtering
-  // ---------------------------------------------------------------------------
-  app.get('/api/storage/objects', (req: Request, res: Response) => {
-    const categoryFilter = String(req.query.category || 'all').toLowerCase();
-    const searchQuery = String(req.query.search || '').trim().toLowerCase();
-    const includeSandbox = req.query.includeSandbox !== 'false';
-
-    const records: StoredObjectRecord[] = [
-      ...Array.from(buckets[S3_CONFIG.privateBucket].values()),
-      ...(includeSandbox ? Array.from(buckets[S3_CONFIG.publicDemoBucket].values()) : []),
-    ];
-
-    const filtered = records.filter((obj) => {
-      if (categoryFilter !== 'all' && obj.category !== categoryFilter) {
-        return false;
-      }
-      if (searchQuery) {
-        const inKey = obj.key.toLowerCase().includes(searchQuery);
-        const inFilename = obj.filename.toLowerCase().includes(searchQuery);
-        const inMeta = Object.entries(obj.metadata).some(
-          ([k, v]) =>
-            `${k}=${v}`.toLowerCase().includes(searchQuery) ||
-            v.toLowerCase().includes(searchQuery)
-        );
-        const inTags = Object.entries(obj.tags).some(
-          ([k, v]) =>
-            `${k}=${v}`.toLowerCase().includes(searchQuery) ||
-            `${k}: ${v}`.toLowerCase().includes(searchQuery) ||
-            v.toLowerCase().includes(searchQuery)
-        );
-        return inKey || inFilename || inMeta || inTags;
-      }
-      return true;
-    });
-
-    res.json({
-      objects: filtered.map(serializeObject),
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // 3. Upload Categorized Object with Custom Metadata and Tags
-  // ---------------------------------------------------------------------------
-  app.post('/api/storage/upload', (req: Request, res: Response) => {
+  app.get('/api/storage/status', async (_req: Request, res: Response) => {
     try {
-      const {
-        filename,
-        category = 'documents',
-        contentType = 'application/octet-stream',
-        contentBase64,
-        metadata = {},
-        tags = {},
-        usePublicDemoBucket = false,
-      } = req.body;
+      await s3.send(new HeadBucketCommand({ Bucket: S3_CONFIG.bucket }));
+      const objects = await listAllObjects();
+      const categoryBreakdown: Record<string, { count: number; bytes: number }> = {
+        documents: { count: 0, bytes: 0 }, images: { count: 0, bytes: 0 }, reports: { count: 0, bytes: 0 }, projects: { count: 0, bytes: 0 },
+      };
+      for (const object of objects) {
+        if (!categoryBreakdown[object.category]) categoryBreakdown[object.category] = { count: 0, bytes: 0 };
+        categoryBreakdown[object.category].count += 1;
+        categoryBreakdown[object.category].bytes += object.sizeBytes;
+      }
+      const now = Date.now();
+      res.json({
+        connected: true,
+        service: 'Amazon S3',
+        endpointUrl: `https://s3.${S3_CONFIG.region}.amazonaws.com`,
+        region: S3_CONFIG.region,
+        privateBucket: S3_CONFIG.bucket,
+        publicDemoBucket: '',
+        publicDemoModeEnabled: false,
+        defaultPresignedExpiration: defaultExpirationSeconds,
+        stats: {
+          totalFiles: objects.length,
+          privateFiles: objects.length,
+          sandboxFiles: 0,
+          totalBytes: objects.reduce((sum, item) => sum + item.sizeBytes, 0),
+          activeTemporaryLinks: trackedPresignedLinks.filter((link) => link.expiresMs > now).length,
+          totalTrackedLinks: trackedPresignedLinks.length,
+        },
+        categoryBreakdown,
+      });
+    } catch (error: any) {
+      // Log only AWS error metadata; never log credentials or request headers.
+      console.error('AWS STATUS CHECK FAILED:', {
+        name: error?.name,
+        code: error?.Code || error?.code,
+        httpStatus: error?.$metadata?.httpStatusCode,
+        message: error?.message,
+        requestId: error?.$metadata?.requestId,
+      });
+      res.status(503).json({
+        connected: false,
+        service: 'Amazon S3',
+        region: S3_CONFIG.region,
+        privateBucket: S3_CONFIG.bucket,
+        error: error?.message || 'Could not connect to the configured S3 bucket.',
+      });
+    }
+  });
 
+  app.get('/api/storage/objects', async (req: Request, res: Response) => {
+    try {
+      const categoryFilter = String(req.query.category || 'all').toLowerCase();
+      const searchQuery = String(req.query.search || '').trim().toLowerCase();
+      let records = await listAllObjects();
+      if (categoryFilter !== 'all') records = records.filter((item) => item.category === categoryFilter);
+      if (searchQuery) records = records.filter((item) => {
+        const metadataText = Object.entries(item.metadata).map(([key, value]) => `${key}=${value}`).join(' ');
+        const tagText = Object.entries(item.tags).map(([key, value]) => `${key}=${value}`).join(' ');
+        return `${item.key} ${item.filename} ${metadataText} ${tagText}`.toLowerCase().includes(searchQuery);
+      });
+      res.json({ objects: records.map(serializeObject) });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || 'Could not list S3 objects.' });
+    }
+  });
+
+  app.post('/api/storage/upload', async (req: Request, res: Response) => {
+    try {
+      const { filename, category = 'documents', contentType = 'application/octet-stream', contentBase64, metadata = {}, tags = {}, usePublicDemoBucket = false } = req.body || {};
+      if (usePublicDemoBucket) return res.status(403).json({ error: 'Public demo uploads are disabled. This deployment keeps every object private.' });
+      if (typeof contentBase64 !== 'string' || !contentBase64) return res.status(400).json({ error: 'A base64-encoded file body is required.' });
       const cleanFilename = sanitizeFilename(filename);
       const normalizedCategory = sanitizeCategoryPrefix(String(category));
-
-      if (usePublicDemoBucket && !publicDemoModeEnabled) {
-        res.status(403).json({
-          error:
-            'Public-read demonstration mode must be explicitly confirmed and enabled in Access & Security before uploading to the isolated sandbox bucket.',
-        });
-        return;
-      }
-
-      const targetBucket = usePublicDemoBucket
-        ? S3_CONFIG.publicDemoBucket
-        : S3_CONFIG.privateBucket;
-
-      const bodyBuffer = Buffer.from(contentBase64 || '', 'base64');
       const key = `${normalizedCategory}/${cleanFilename}`;
-      const etag = crypto.createHash('md5').update(bodyBuffer).digest('hex');
-
-      const cleanMetadata: Record<string, string> = {};
-      for (const [k, v] of Object.entries(metadata || {})) {
-        if (k && v !== undefined && String(v).trim()) {
-          cleanMetadata[k.trim().toLowerCase().replace(/\s+/g, '-')] = String(v).trim();
-        }
-      }
-
-      const cleanTags: Record<string, string> = {};
-      for (const [k, v] of Object.entries(tags || {})) {
-        if (k && v !== undefined && String(v).trim()) {
-          cleanTags[k.trim()] = String(v).trim();
-        }
-      }
-      if (Object.keys(cleanTags).length === 0) {
-        cleanTags.Category =
-          normalizedCategory.charAt(0).toUpperCase() + normalizedCategory.slice(1);
-      }
-
-      const record: StoredObjectRecord = {
-        key,
-        filename: cleanFilename,
-        category: normalizedCategory,
-        bucket: targetBucket,
-        contentType: contentType || 'application/octet-stream',
-        sizeBytes: bodyBuffer.length,
-        lastModified: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
-        etag,
-        body: bodyBuffer,
-        metadata: cleanMetadata,
-        tags: cleanTags,
-      };
-
-      buckets[targetBucket].set(key, record);
-      res.status(201).json({
-        message: `Uploaded '${cleanFilename}' to '${normalizedCategory}/' (${
-          usePublicDemoBucket ? 'Isolated Sandbox' : 'Private Vault'
-        }).`,
-        object: serializeObject(record),
-      });
-    } catch (err: any) {
-      res.status(400).json({ error: err.message || 'Upload failed.' });
+      const body = Buffer.from(contentBase64, 'base64');
+      if (!body.length) return res.status(400).json({ error: 'The uploaded file is empty or its base64 data is invalid.' });
+      const cleanMetadata = normalizeMetadata(metadata);
+      const cleanTags = normalizeTags(tags);
+      if (!Object.keys(cleanTags).length) cleanTags.Category = normalizedCategory;
+      await s3.send(new PutObjectCommand({
+        Bucket: S3_CONFIG.bucket,
+        Key: key,
+        Body: body,
+        ContentType: String(contentType || 'application/octet-stream'),
+        Metadata: cleanMetadata,
+        Tagging: toTaggingString(cleanTags),
+        ServerSideEncryption: 'AES256',
+      }));
+      const record = await getObjectRecord(key);
+      if (!record) throw new Error('Upload succeeded but the object could not be read back from S3.');
+      res.status(201).json({ message: `Uploaded '${cleanFilename}' to '${normalizedCategory}/' (Private AWS S3).`, object: serializeObject(record) });
+    } catch (error: any) {
+      res.status(400).json({ error: error.message || 'Upload failed.' });
     }
   });
 
-  // ---------------------------------------------------------------------------
-  // 4. Update Object Tags & Metadata
-  // ---------------------------------------------------------------------------
-  app.put('/api/storage/tags', (req: Request, res: Response) => {
-    const { bucket = S3_CONFIG.privateBucket, key, tags, metadata } = req.body;
-    const bucketMap = buckets[bucket];
-    if (!bucketMap || !bucketMap.has(key)) {
-      res.status(404).json({ error: `Object '${key}' not found in bucket '${bucket}'.` });
-      return;
+  app.put('/api/storage/tags', async (req: Request, res: Response) => {
+    try {
+      const bucket = assertPrivateBucket(req.body?.bucket);
+      const key = String(req.body?.key || '');
+      if (!key || key.includes('..') || key.startsWith('/')) return res.status(400).json({ error: 'A valid object key is required.' });
+      const current = await getObjectRecord(key);
+      if (!current) return res.status(404).json({ error: `Object '${key}' not found in bucket '${bucket}'.` });
+      const updatedMetadata = req.body?.metadata === undefined ? current.metadata : normalizeMetadata(req.body.metadata);
+      const updatedTags = req.body?.tags === undefined ? current.tags : normalizeTags(req.body.tags);
+      // S3 user metadata is immutable: copy the object onto itself with replacement metadata.
+      await s3.send(new CopyObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        CopySource: `${bucket}/${encodeURIComponent(key).replace(/%2F/g, '/')}`,
+        MetadataDirective: 'REPLACE',
+        Metadata: updatedMetadata,
+        ContentType: current.contentType,
+        ServerSideEncryption: 'AES256',
+      }));
+      await s3.send(new PutObjectTaggingCommand({ Bucket: bucket, Key: key, Tagging: { TagSet: Object.entries(updatedTags).map(([Key, Value]) => ({ Key, Value })) } }));
+      const updated = await getObjectRecord(key);
+      if (!updated) throw new Error('Could not read the updated object from S3.');
+      res.json({ message: `Saved metadata and tags for '${updated.filename}'.`, object: serializeObject(updated) });
+    } catch (error: any) {
+      res.status(400).json({ error: error.message || 'Could not update object metadata and tags.' });
     }
+  });
 
-    const record = bucketMap.get(key)!;
-    if (tags && typeof tags === 'object') {
-      const updatedTags: Record<string, string> = {};
-      for (const [k, v] of Object.entries(tags)) {
-        if (k.trim() && String(v).trim()) {
-          updatedTags[k.trim()] = String(v).trim();
-        }
+  app.get('/api/storage/download', async (req: Request, res: Response) => {
+    try {
+      assertPrivateBucket(req.query.bucket);
+      const key = String(req.query.key || '');
+      if (!key || key.includes('..') || key.startsWith('/')) return res.status(400).json({ error: 'A valid object key is required.' });
+      const object = await s3.send(new GetObjectCommand({ Bucket: S3_CONFIG.bucket, Key: key }));
+      const bytes = await object.Body?.transformToByteArray();
+      if (!bytes) return res.status(404).json({ error: 'The requested object has no body.' });
+      const filename = path.posix.basename(key).replace(/["\r\n]/g, '_');
+      res.setHeader('Content-Type', object.ContentType || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      if (object.ETag) res.setHeader('ETag', object.ETag);
+      res.send(Buffer.from(bytes));
+    } catch (error: any) {
+      const status = error?.$metadata?.httpStatusCode === 404 ? 404 : 500;
+      res.status(status).json({ error: error.message || 'Download failed.' });
+    }
+  });
+
+  app.delete('/api/storage/object', async (req: Request, res: Response) => {
+    try {
+      const bucket = assertPrivateBucket(req.body?.bucket);
+      const key = String(req.body?.key || '');
+      if (!req.body?.confirmed) return res.status(400).json({ error: 'Explicit confirmation is required before deleting a file.' });
+      const existing = await getObjectRecord(key);
+      if (!existing) return res.status(404).json({ error: `NoSuchKey: Object '${key}' does not exist.` });
+      await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+      for (let i = trackedPresignedLinks.length - 1; i >= 0; i--) {
+        if (trackedPresignedLinks[i].bucket === bucket && trackedPresignedLinks[i].objectKey === key) trackedPresignedLinks.splice(i, 1);
       }
-      record.tags = updatedTags;
+      res.json({ message: `Deleted '${existing.filename}' permanently from AWS S3.`, deleted: true });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || 'Delete failed.' });
     }
-
-    if (metadata && typeof metadata === 'object') {
-      const updatedMeta: Record<string, string> = {};
-      for (const [k, v] of Object.entries(metadata)) {
-        if (k.trim() && String(v).trim()) {
-          updatedMeta[k.trim().toLowerCase()] = String(v).trim();
-        }
-      }
-      record.metadata = updatedMeta;
-    }
-
-    res.json({
-      message: `Saved metadata and tags for '${record.filename}'.`,
-      object: serializeObject(record),
-    });
   });
 
-  // ---------------------------------------------------------------------------
-  // 5. Authorized Download (Server-Side Credentialed Stream)
-  // ---------------------------------------------------------------------------
-  app.get('/api/storage/download', (req: Request, res: Response) => {
-    const bucket = String(req.query.bucket || S3_CONFIG.privateBucket);
-    const key = String(req.query.key || '');
-    const bucketMap = buckets[bucket];
-    if (!bucketMap || !bucketMap.has(key)) {
-      res.status(404).json({ error: `NoSuchKey: The specified key '${key}' does not exist.` });
-      return;
-    }
-    const record = bucketMap.get(key)!;
-    res.setHeader('Content-Type', record.contentType);
-    res.setHeader('Content-Disposition', `attachment; filename="${record.filename}"`);
-    res.setHeader('ETag', `"${record.etag}"`);
-    res.send(record.body);
+  app.post('/api/storage/public-demo', (_req: Request, res: Response) => {
+    res.status(403).json({ publicDemoModeEnabled: false, error: 'Public demo mode is disabled in this private-by-default AWS deployment.' });
   });
 
-  // ---------------------------------------------------------------------------
-  // 6. Delete Object (Requires Explicit Confirmation)
-  // ---------------------------------------------------------------------------
-  app.delete('/api/storage/object', (req: Request, res: Response) => {
-    const { bucket = S3_CONFIG.privateBucket, key, confirmed } = req.body;
-    if (!confirmed) {
-      res.status(400).json({
-        error: 'Explicit confirmation is required before deleting a file.',
-      });
-      return;
-    }
-    const bucketMap = buckets[bucket];
-    if (!bucketMap || !bucketMap.has(key)) {
-      res.status(404).json({ error: `NoSuchKey: Object '${key}' does not exist.` });
-      return;
-    }
-    const filename = bucketMap.get(key)!.filename;
-    bucketMap.delete(key);
-
-    // Also remove tracked links for deleted object
-    for (let i = trackedPresignedLinks.length - 1; i >= 0; i--) {
-      if (
-        trackedPresignedLinks[i].bucket === bucket &&
-        trackedPresignedLinks[i].objectKey === key
-      ) {
-        trackedPresignedLinks.splice(i, 1);
-      }
-    }
-
-    res.json({ message: `Deleted '${filename}' permanently.`, deleted: true });
-  });
-
-  // ---------------------------------------------------------------------------
-  // 7. Toggle Isolated Public-Read Sandbox Demonstration Mode
-  // ---------------------------------------------------------------------------
-  app.post('/api/storage/public-demo', (req: Request, res: Response) => {
-    const { enabled, explicitConfirmation } = req.body;
-    if (enabled && !explicitConfirmation) {
-      res.status(403).json({
-        error:
-          'Explicit confirmation is required before enabling public-read demonstration mode on the isolated sandbox bucket.',
-      });
-      return;
-    }
-    publicDemoModeEnabled = Boolean(enabled);
-    res.json({
-      publicDemoModeEnabled,
-      publicDemoBucket: S3_CONFIG.publicDemoBucket,
-      privateBucket: S3_CONFIG.privateBucket,
-      privateBucketRemainsProtected: true,
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // 8. Update Default Settings
-  // ---------------------------------------------------------------------------
   app.put('/api/storage/settings', (req: Request, res: Response) => {
-    const { defaultPresignedExpiration } = req.body;
-    const parsed = Number(defaultPresignedExpiration);
-    if (!Number.isFinite(parsed) || parsed < 1 || parsed > 604800) {
-      res.status(400).json({
-        error: 'Default expiration must be between 1 and 604800 seconds.',
-      });
-      return;
-    }
+    const parsed = Number(req.body?.defaultPresignedExpiration);
+    if (!Number.isFinite(parsed) || parsed < 1 || parsed > 604800) return res.status(400).json({ error: 'Default expiration must be between 1 and 604800 seconds.' });
     defaultExpirationSeconds = parsed;
-    res.json({
-      message: `Updated default temporary link expiration to ${parsed} seconds.`,
-      defaultPresignedExpiration: defaultExpirationSeconds,
-    });
+    res.json({ message: `Updated default temporary link expiration to ${parsed} seconds.`, defaultPresignedExpiration: defaultExpirationSeconds });
   });
 
-  // ---------------------------------------------------------------------------
-  // 9. Generate & Track Pre-Signed URLs (HMAC-SHA256 / AWS Signature V4)
-  // ---------------------------------------------------------------------------
   app.get('/api/storage/presigned-links', (_req: Request, res: Response) => {
-    const nowMs = Date.now();
-    const links = trackedPresignedLinks.map((item) => ({
-      ...item,
-      isExpired: nowMs > item.expiresMs,
-      remainingSeconds: Math.max(0, Math.ceil((item.expiresMs - nowMs) / 1000)),
-    }));
-    res.json({ links });
+    const now = Date.now();
+    res.json({ links: trackedPresignedLinks.map((item) => ({ ...item, isExpired: now > item.expiresMs, remainingSeconds: Math.max(0, Math.ceil((item.expiresMs - now) / 1000)) })) });
   });
 
-  app.post('/api/storage/presign', (req: Request, res: Response) => {
-    const {
-      bucket = S3_CONFIG.privateBucket,
-      key,
-      expirationSeconds = defaultExpirationSeconds,
-      backdateSeconds = 0,
-    } = req.body;
-
-    const bucketMap = buckets[bucket];
-    if (!bucketMap || !bucketMap.has(key)) {
-      res.status(404).json({ error: `NoSuchKey: Cannot pre-sign missing object '${key}'.` });
-      return;
+  app.post('/api/storage/presign', async (req: Request, res: Response) => {
+    try {
+      const bucket = assertPrivateBucket(req.body?.bucket);
+      const key = String(req.body?.key || '');
+      const expiry = Number(req.body?.expirationSeconds ?? defaultExpirationSeconds);
+      const backdateSeconds = Math.max(0, Number(req.body?.backdateSeconds || 0));
+      if (!key || key.includes('..') || key.startsWith('/')) return res.status(400).json({ error: 'A valid object key is required.' });
+      if (!Number.isFinite(expiry) || expiry < 1 || expiry > 604800) return res.status(400).json({ error: 'Expiration must be between 1 and 604800 seconds.' });
+      const record = await getObjectRecord(key);
+      if (!record) return res.status(404).json({ error: `NoSuchKey: Cannot pre-sign missing object '${key}'.` });
+      const issuedMs = Date.now() - backdateSeconds * 1000;
+      const issuedDate = new Date(issuedMs);
+      const expiresMs = issuedMs + expiry * 1000;
+      const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: key }), { expiresIn: expiry, signingDate: issuedDate });
+      const encodedKey = key.split('/').map(encodeURIComponent).join('/');
+      const directAnonymousUrl = `/s3/${encodeURIComponent(bucket)}/${encodedKey}`;
+      const linkEntry: TrackedPresignedLink = {
+        id: crypto.randomUUID(), url, directAnonymousUrl, bucket, objectKey: key, filename: record.filename, category: record.category,
+        expirationSeconds: expiry, issuedAt: issuedDate.toISOString(), expiresAt: new Date(expiresMs).toISOString(), issuedMs, expiresMs, objectRemainsPrivate: true,
+      };
+      trackedPresignedLinks.unshift(linkEntry);
+      if (trackedPresignedLinks.length > 25) trackedPresignedLinks.pop();
+      res.json(linkEntry);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || 'Could not generate a pre-signed URL.' });
     }
-
-    const record = bucketMap.get(key)!;
-    const expiry = Number(expirationSeconds);
-    if (!Number.isFinite(expiry) || expiry < 1 || expiry > 604800) {
-      res.status(400).json({ error: 'Expiration must be between 1 and 604800 seconds.' });
-      return;
-    }
-
-    const issuedMs = Date.now() - Number(backdateSeconds || 0) * 1000;
-    const expiresMs = issuedMs + expiry * 1000;
-    const issuedDate = new Date(issuedMs);
-    const amzDate = issuedDate
-      .toISOString()
-      .replace(/[-:]/g, '')
-      .replace(/\.\d{3}Z$/, 'Z');
-    const datestamp = amzDate.slice(0, 8);
-    const credential = `${S3_CONFIG.accessKey}/${datestamp}/${S3_CONFIG.region}/s3/aws4_request`;
-
-    const signature = signPresignedParams(
-      bucket,
-      key,
-      amzDate,
-      expiry,
-      issuedMs,
-      credential
-    );
-
-    const params = new URLSearchParams({
-      'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
-      'X-Amz-Credential': credential,
-      'X-Amz-Date': amzDate,
-      'X-Amz-Expires': String(expiry),
-      'X-Amz-Issued-Ms': String(issuedMs),
-      'X-Amz-SignedHeaders': 'host',
-      'X-Amz-Signature': signature,
-    });
-
-    const encodedKey = key.split('/').map(encodeURIComponent).join('/');
-    const relativeUrl = `/s3/${encodeURIComponent(bucket)}/${encodedKey}?${params.toString()}`;
-    const directAnonymousUrl = `/s3/${encodeURIComponent(bucket)}/${encodedKey}`;
-
-    const linkEntry: TrackedPresignedLink = {
-      id: crypto.randomUUID(),
-      url: relativeUrl,
-      directAnonymousUrl,
-      bucket,
-      objectKey: key,
-      filename: record.filename,
-      category: record.category,
-      expirationSeconds: expiry,
-      issuedAt: issuedDate.toISOString(),
-      expiresAt: new Date(expiresMs).toISOString(),
-      issuedMs,
-      expiresMs,
-      objectRemainsPrivate: bucket === S3_CONFIG.privateBucket,
-    };
-
-    trackedPresignedLinks.unshift(linkEntry);
-    if (trackedPresignedLinks.length > 25) {
-      trackedPresignedLinks.pop();
-    }
-
-    res.json(linkEntry);
   });
 
-  // ---------------------------------------------------------------------------
-  // 10. Raw S3 Object Endpoint (/s3/:bucket/*) Enforcing Private & Pre-Signed Rules
-  // ---------------------------------------------------------------------------
-  app.get('/s3/:bucket/*', (req: Request, res: Response) => {
-    const bucket = req.params.bucket;
-    const key = (req.params as Record<string, string>)[0] || '';
-    const bucketMap = buckets[bucket];
-
-    if (!bucketMap) {
-      res.status(404).json({
-        Error: {
-          Code: 'NoSuchBucket',
-          Message: `The specified bucket '${bucket}' does not exist.`,
-        },
-      });
-      return;
-    }
-
-    const hasSignature = typeof req.query['X-Amz-Signature'] === 'string';
-
-    if (hasSignature) {
-      const amzDate = String(req.query['X-Amz-Date'] || '');
-      const expiresSeconds = Number(req.query['X-Amz-Expires'] || 0);
-      const issuedMs = Number(req.query['X-Amz-Issued-Ms'] || 0);
-      const credential = String(req.query['X-Amz-Credential'] || '');
-      const providedSig = String(req.query['X-Amz-Signature'] || '');
-
-      if (
-        !amzDate ||
-        !expiresSeconds ||
-        !issuedMs ||
-        !credential.startsWith(`${S3_CONFIG.accessKey}/`)
-      ) {
-        res.status(403).json({
-          Error: {
-            Code: 'AuthorizationQueryParametersError',
-            Message: 'Incomplete or malformed AWS Signature V4 query parameters.',
-          },
-        });
-        return;
-      }
-
-      const expectedSig = signPresignedParams(
-        bucket,
-        key,
-        amzDate,
-        expiresSeconds,
-        issuedMs,
-        credential
-      );
-
-      if (providedSig !== expectedSig) {
-        res.status(403).json({
-          Error: {
-            Code: 'SignatureDoesNotMatch',
-            Message:
-              'The request signature we calculated does not match the signature you provided.',
-          },
-        });
-        return;
-      }
-
-      if (Date.now() > issuedMs + expiresSeconds * 1000) {
-        res.status(403).json({
-          Error: {
-            Code: 'RequestHasExpired',
-            Message: 'Request has expired. Pre-signed URL TTL has elapsed.',
-            ExpiresAt: new Date(issuedMs + expiresSeconds * 1000).toISOString(),
-          },
-        });
-        return;
-      }
-    } else {
-      const isAllowedPublicSandbox =
-        bucket === S3_CONFIG.publicDemoBucket && publicDemoModeEnabled;
-      if (!isAllowedPublicSandbox) {
-        res.status(403).json({
-          Error: {
-            Code: 'AccessDenied',
-            Message:
-              'Access Denied. File is private by default. Authenticate or generate a temporary pre-signed link.',
-            Bucket: bucket,
-            Key: key,
-          },
-        });
-        return;
-      }
-    }
-
-    if (!bucketMap.has(key)) {
-      res.status(404).json({
-        Error: {
-          Code: 'NoSuchKey',
-          Message: `The specified key '${key}' does not exist.`,
-        },
-      });
-      return;
-    }
-
-    const record = bucketMap.get(key)!;
-    res.setHeader('Content-Type', record.contentType);
-    res.setHeader('ETag', `"${record.etag}"`);
-    for (const [mk, mv] of Object.entries(record.metadata)) {
-      res.setHeader(`x-amz-meta-${mk}`, mv);
-    }
-    res.send(record.body);
+  // This route deliberately rejects anonymous object requests. Valid share URLs
+  // are signed by AWS and point directly to the private S3 object.
+  app.get('/s3/:bucket/*', (_req: Request, res: Response) => {
+    res.status(403).json({ Error: { Code: 'AccessDenied', Message: 'Access denied. Objects are private; use a valid AWS S3 pre-signed URL.' } });
   });
 
-  // ---------------------------------------------------------------------------
-  // 11. Execute Live Python Automated Test Suite
-  // ---------------------------------------------------------------------------
   app.post('/api/tests/run', (_req: Request, res: Response) => {
     const startTime = Date.now();
-    execFile(
-      process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3'),
-      ['-m', 'unittest', 'discover', '-s', 'tests', '-v'],
-      { cwd: __dirname, timeout: 60000 },
-      (error, stdout, stderr) => {
-        const durationMs = Date.now() - startTime;
-        const combinedOutput = `${stdout}\n${stderr}`.trim();
-        const lines = combinedOutput.split('\n');
-        const parsedTests: Array<{
-          name: string;
-          suite: string;
-          description: string;
-          status: 'PASS' | 'FAIL';
-        }> = [];
-
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i].trim();
-          const match = line.match(/^(test_\w+)\s+\(([^)]+)\)/);
-          if (match) {
-            const fnName = match[1];
-            const suiteName = match[2];
-            const nextLine = (lines[i + 1] || '').trim();
-            const isPass =
-              line.endsWith('... ok') || nextLine.endsWith('... ok');
-            const desc = nextLine
-              .replace(/\s*\.\.\.\s*(ok|ERROR|FAIL).*$/i, '')
-              .trim();
-            parsedTests.push({
-              name: fnName,
-              suite: suiteName,
-              description: desc || fnName,
-              status: isPass ? 'PASS' : 'FAIL',
-            });
-          }
-        }
-
-        const passedCount = parsedTests.filter((t) => t.status === 'PASS').length;
-        const failedCount = parsedTests.length - passedCount;
-
-        res.json({
-          passed: !error && failedCount === 0,
-          durationMs,
-          totalTests: parsedTests.length,
-          passedCount,
-          failedCount,
-          tests: parsedTests,
-          rawOutput: combinedOutput,
-        });
+    execFile(process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3'), ['-m', 'unittest', 'discover', '-s', 'tests', '-v'], { cwd: __dirname, timeout: 60000 }, (error, stdout, stderr) => {
+      const durationMs = Date.now() - startTime;
+      const combinedOutput = `${stdout || ''}\n${stderr || ''}`.trim();
+      const lines = combinedOutput.split('\n');
+      const tests: Array<{ name: string; suite: string; description: string; status: 'PASS' | 'FAIL' }> = [];
+      for (let i = 0; i < lines.length; i++) {
+        const match = lines[i].trim().match(/^(test_\w+)\s+\(([^)]+)\)/);
+        if (!match) continue;
+        const line = lines[i].trim();
+        const nextLine = (lines[i + 1] || '').trim();
+        const passed = line.endsWith('... ok') || nextLine.endsWith('... ok');
+        tests.push({ name: match[1], suite: match[2], description: nextLine.replace(/\s*\.\.\.\s*(ok|ERROR|FAIL).*$/i, '').trim() || match[1], status: passed ? 'PASS' : 'FAIL' });
       }
-    );
+      const passedCount = tests.filter((test) => test.status === 'PASS').length;
+      res.json({ passed: !error && tests.length > 0 && passedCount === tests.length, durationMs, totalTests: tests.length, passedCount, failedCount: tests.length - passedCount, tests, rawOutput: combinedOutput || (error ? error.message : 'No Python test output was produced.') });
+    });
   });
 
-  // ---------------------------------------------------------------------------
-  // 12. Inspect Python Project Files
-  // ---------------------------------------------------------------------------
   app.get('/api/project-files', (_req: Request, res: Response) => {
-    const filePaths = [
-      'app.py',
-      'config.py',
-      'docker-compose.yml',
-      'README.md',
-      'requirements.txt',
-      'storage_manager.py',
-      'tests/test_security.py',
-      'tests/test_storage_manager.py',
-    ];
-
+    const filePaths = ['app.py', 'config.py', 'docker-compose.yml', 'README.md', 'requirements.txt', 'storage_manager.py', 'tests/test_security.py', 'tests/test_storage_manager.py'];
     const files = filePaths.map((relPath) => {
       const absPath = path.join(__dirname, relPath);
-      const content = fs.existsSync(absPath) ? fs.readFileSync(absPath, 'utf-8') : '';
-      return {
-        path: relPath,
-        name: relPath,
-        sizeBytes: Buffer.byteLength(content, 'utf-8'),
-        content,
-      };
+      const content = fs.existsSync(absPath) ? fs.readFileSync(absPath, 'utf8') : '';
+      return { path: relPath, name: relPath, sizeBytes: Buffer.byteLength(content, 'utf8'), content };
     });
-
     res.json({ files });
   });
 
   if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(__dirname, 'dist');
     app.use(express.static(distPath));
-    app.get('*', (_req: Request, res: Response) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+    app.get('*', (_req: Request, res: Response) => res.sendFile(path.join(distPath, 'index.html')));
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Cloud Storage Organizer running at http://0.0.0.0:${PORT}`);
-  });
+  app.listen(PORT, '0.0.0.0', () => console.log(`Cloud Storage Organizer running on port ${PORT}; S3 bucket: ${S3_CONFIG.bucket} (${S3_CONFIG.region})`));
 }
 
-startServer();
+startServer().catch((error) => {
+  console.error('Failed to start Cloud Storage Organizer:', error);
+  process.exit(1);
+});

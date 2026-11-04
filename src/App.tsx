@@ -777,7 +777,7 @@ export default function App() {
       const bodyText = await res.text();
       setProbeResult({
         targetType: label,
-        url: `${window.location.origin}${urlToFetch}`,
+        url: new URL(urlToFetch, window.location.origin).toString(),
         httpStatus: res.status,
         statusText:
           res.status === 200
@@ -2367,16 +2367,13 @@ export default function App() {
                       </span>
                     </div>
                     <div className="p-3 rounded-xl bg-slate-900 font-mono text-xs text-indigo-100 break-all">
-                      {window.location.origin}
                       {latestGeneratedLink.url}
                     </div>
                     <div className="flex flex-wrap items-center gap-2.5">
                       <button
                         type="button"
                         onClick={() => {
-                          navigator.clipboard.writeText(
-                            `${window.location.origin}${latestGeneratedLink.url}`
-                          );
+                          navigator.clipboard.writeText(latestGeneratedLink.url);
                           setCopiedLinkId(latestGeneratedLink.id);
                           setTimeout(() => setCopiedLinkId(''), 2000);
                         }}
@@ -2517,9 +2514,7 @@ export default function App() {
                                 <button
                                   type="button"
                                   onClick={() => {
-                                    navigator.clipboard.writeText(
-                                      `${window.location.origin}${link.url}`
-                                    );
+                                    navigator.clipboard.writeText(link.url);
                                     setCopiedLinkId(link.id);
                                     setTimeout(() => setCopiedLinkId(''), 2000);
                                   }}
