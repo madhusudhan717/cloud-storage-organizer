@@ -4,7 +4,9 @@ A web-based file management application built with **React, Vite, Node.js, Expre
 
 **Live application:** https://cloud-storage-organizer-madhu.onrender.com  
 **Username:** madhusudhan717
+
 **Password:** madhu123
+
 **GitHub repository:** https://github.com/madhusudhan717/cloud-storage-organizer
 
 > **Current deployment:** The main application is the React/Vite dashboard served by the Express application. Render hosts the dashboard and API in one web service; Amazon S3 stores uploaded files. A separate Vercel deployment is not required for this architecture.
