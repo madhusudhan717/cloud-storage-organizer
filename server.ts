@@ -210,7 +210,23 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 3000);
 
+  if (
+    process.env.NODE_ENV === 'production' &&
+    (!process.env.APP_USERNAME || !process.env.APP_PASSWORD)
+  ) {
+    throw new Error(
+      'APP_USERNAME and APP_PASSWORD are required in production.'
+    );
+  }
+
   app.disable('x-powered-by');
+
+  // Public health check for Render
+  app.get('/health', (_req: Request, res: Response) => {
+    res.status(200).json({ status: 'ok' });
+  });
+
+  // Protect the application and API routes
   app.use(basicAuth);
   app.use((req, res, next) => {
     const allowedOrigins = (process.env.CORS_ORIGIN || '').split(',').map((item) => item.trim()).filter(Boolean);
