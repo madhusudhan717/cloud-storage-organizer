@@ -3,6 +3,8 @@
 A web-based file management application built with **React, Vite, Node.js, Express, and Amazon S3**. It lets users upload, organize, search, tag, download, delete, and temporarily share files while keeping objects private in S3 by default.
 
 **Live application:** https://cloud-storage-organizer-madhu.onrender.com  
+**Username:** madhusudhan717
+**Password:** madhu123
 **GitHub repository:** https://github.com/madhusudhan717/cloud-storage-organizer
 
 > **Current deployment:** The main application is the React/Vite dashboard served by the Express application. Render hosts the dashboard and API in one web service; Amazon S3 stores uploaded files. A separate Vercel deployment is not required for this architecture.
@@ -499,3 +501,9 @@ For that earlier prototype, the repository includes a Docker Compose MinIO setup
 ## License
 
 Add your project's chosen license here before distributing or reusing the code. No license is declared in this README.
+
+## Output
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/a4ddc07d-a028-4530-808e-66fdd94377d0" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/8143309f-d191-46ab-bc19-c1ebc3f19e13" />
+
+
